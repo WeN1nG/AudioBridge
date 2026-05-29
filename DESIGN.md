@@ -12,19 +12,19 @@
 
 | 层面 | 选择 | 理由 |
 |------|------|------|
-| 虚拟音频驱动 | **C++ (KMDF / WDM Audio Driver)** 基于 [Scream](https://github.com/duncanthrax/scream) 改造 | Windows 虚拟音频设备必须通过内核级驱动实现，WASAPI 等用户态 API 无法创建虚拟端点。Scream 是 MIT 开源的全双工虚拟音频驱动，可直接作为起点修改 |
-| 用户态主程序 | **C# .NET 8** | 与 Windows 音频 API、命名管道和 ADB 进程通信方便，开发效率高。NAudio 库提供音频格式转换支持 |
-| Android 音频播放 | **C + NDK (AAudio API)** 交叉编译为 ARM64 静态链接 ELF | 不需要开发 Android App。一个约 100 行的 C 程序，通过 AAudio 从 stdin 读取 PCM 数据并播放到扬声器。用 NDK 交叉编译后 `adb push` 到设备，通过 `adb exec-out` 启动并管道传输 PCM |
-| USB 传输 | **ADB exec-out 管道** | Android 设备默认运行 adbd。PC 端通过 `adb exec-out` 启动设备上的播放器进程，播放器从 stdin 读取 PCM。不需要 TCP forward，不需要网络，纯管道传输 |
-| 音频传输格式 | **原始 PCM 流 (16-bit 48000Hz 双声道)** | 免编解码延迟最小，USB 2.0 带宽足够。播放器不做任何编解码，直接从 stdin read → AAudio write |
-| 设备检测 | **ADB 命令 + Android `dumpsys audio`** | 通过 `adb devices` 枚举设备，通过 `adb shell dumpsys audio` 判断设备是否具有扬声器 |
-| 构建工具 | MSBuild / Android NDK | C# 用 MSBuild 构建；C 播放器用 NDK 的 standalone toolchain 编译 |
+| 音频捕获 | **WASAPI Loopback (C# COM P/Invoke)** | 用户态 API，零驱动安装。从默认音频渲染设备捕获混音后的输出流。不需要虚拟音频驱动 |
+| 主程序 | **C# .NET 8** | 与 Windows COM API、ADB 进程管理交互方便，开发效率高 |
+| Android 音频播放 | **C + NDK (AAudio API)** ARM64 静态链接 ELF | 无需 APK 打包。~300 行 C 程序，TCP socket 读取 PCM 数据，AAudio 写入扬声器。ADB push 到设备后直接运行 |
+| USB 传输 | **ADB TCP 端口转发 (adb forward tcp)** | adbd 内置功能，可靠的全双工流，解耦读写速率，避免管道缓冲区死锁 |
+| 音频传输格式 | **原始 PCM 流 (32-bit int 48000Hz 双声道)** | 免编解码延迟最小，USB 2.0 带宽足够 |
+| 设备检测 | **ADB 命令 + Android `dumpsys audio`** | 通过 `adb devices` 枚举设备，通过 `adb shell dumpsys audio` 多关键词匹配判断设备扬声器能力 |
+| 构建工具 | MSBuild / Android NDK r27d | C# 用 MSBuild 构建；C 播放器用 NDK 的 aarch64-linux-android26-clang 交叉编译 |
 
-**为什么不是 C++ 全栈？** 用户态涉及大量 Windows API 调用和 ADB 进程管理，C# 开发效率更高。仅在必须的内核驱动和 Android 播放器部分使用 C/C++。
+**为什么不用虚拟音频驱动？** WASAPI Loopback 可以在不出现在音频设备列表中的情况下捕获系统混音输出。用户不需要安装任何驱动，也不需要关闭安全启动或进入测试模式。代价是没有持久的虚拟音频设备，程序退出后音频转发终止。
 
-**为什么不用 libusb？** ADB 提供了成熟的 USB 数据通道，用户只需一次性的"开启 USB 调试"配置。libusb 方式需要编写 USB 驱动且兼容性差。
+**为什么不用 libusb？** ADB 提供成熟的 USB 数据通道，用户只需一次性 "开启 USB 调试" 配置。libusb 需要编写 USB 驱动且兼容性差。
 
-**为什么不用 Android App（Kotlin + SDK）？** 不需要。一个 `adb exec-out` 启动的进程即可完成 PCM 播放，无需 Activity、Service、Manifest、APK 打包。开发和调试成本降低一个数量级。
+**为什么不用 Android App（Kotlin + SDK）？** 不需要。一个 ADB 启动的进程即可完成 PCM 播放，无需 Activity、Service、Manifest、APK 打包。开发和调试成本降低一个数量级。
 
 ---
 
@@ -32,7 +32,7 @@
 
 ### 架构风格：管道-过滤器
 
-音频数据流是纯粹的管道-过滤器模式：Windows 音频系统 → 虚拟驱动 → 命名管道 → C# 服务 → ADB 管道 → Android 播放器进程 → 扬声器。不需要网络层和 TCP 协议。
+音频数据流是纯粹的管道-过滤器模式：WASAPI Loopback 捕获 → 格式转换 → 生产者-消费者队列 → TCP 写入 → ADB 转发 → Android 播放器 → 扬声器。
 
 ### 核心模块
 
@@ -40,43 +40,50 @@
 ┌──────────────────────────────────────────────────────────────────┐
 │                          Windows 电脑                             │
 │                                                                  │
-│  ┌──────────────────┐     ┌─────────────────────────────┐        │
-│  │  Windows 音频系统  │     │   Audio Bridge Service      │        │
-│  │  (WASAPI)         │     │   (C# .NET 8 Console App)   │        │
-│  │                   │     │                              │        │
-│  │  应用输出音频 →    │────→│  ┌─────────────────────┐   │        │
-│  │                   │     │  │ AudioCaptureManager  │   │        │
-│  └───────────────────┘     │  │ (命名管道读取 PCM)   │   │        │
-│          │                 │  └─────────┬───────────┘   │        │
-│          ▼                 │            │ PCM 数据      │        │
-│  ┌──────────────────┐      │  ┌─────────▼───────────┐   │        │
-│  │  虚拟音频驱动      │      │  │ StreamForwarder     │   │        │
-│  │  (C++ KMDF)       │◄────│  │ (写入 adb exec-out   │   │        │
-│  │  Scream 改造 →     │     │  │  进程的 stdin)       │   │        │
-│  │  命名管道输出      │     │  └─────────┬───────────┘   │        │
-│  └──────────────────┘      │            │ stdin           │        │
-│                            │  ┌─────────▼───────────┐   │        │
-│                            │  │ DeviceMonitor       │   │        │
-│                            │  │ (USB/ADB 设备检测)   │   │        │
-│                            │  └─────────────────────┘   │        │
-│                            └─────────────────────────────┘        │
-│                                         │ adb exec-out (stdin)    │
+│  ┌──────────────────────┐   ┌─────────────────────────────┐      │
+│  │  Windows 音频系统      │   │  AudioBridge 服务           │      │
+│  │  (WASAPI 混音器)      │   │  (C# .NET 8 Console App)   │      │
+│  │                      │   │                              │      │
+│  │  应用输出 → 默认渲染   │──→│  ┌─────────────────────┐   │      │
+│  │  设备 (板载/HDMI等)   │   │  │ AudioCaptureManager  │   │      │
+│  └──────────────────────┘   │  │ (WASAPI Loopback)     │   │      │
+│                             │  └─────────┬───────────┘   │      │
+│                             │            │ PCM byte[]     │      │
+│                             │  ┌─────────▼───────────┐   │      │
+│                             │  │ SampleConverter      │   │      │
+│                             │  │ (float→int / SRC /   │   │      │
+│                             │  │  位深转换)           │   │      │
+│                             │  └─────────┬───────────┘   │      │
+│                             │            │ 转换后PCM      │      │
+│                             │  ┌─────────▼───────────┐   │      │
+│                             │  │ StreamForwarder      │   │      │
+│                             │  │ (生产者-消费者队列 +  │   │      │
+│                             │  │  TCP写入)            │   │      │
+│                             │  └─────────┬───────────┘   │      │
+│                             │            │ TCP 27777      │      │
+│                             │  ┌─────────▼───────────┐   │      │
+│                             │  │ DeviceWatcher        │   │      │
+│                             │  │ (ADB 设备轮询)        │   │      │
+│                             │  └─────────────────────┘   │      │
+│                             └─────────────────────────────┘      │
+│                                         │ adb forward tcp:27777  │
 └─────────────────────────────────────────┼────────────────────────┘
-                                          │ USB
+                                          │ USB / TCP
 ┌─────────────────────────────────────────┼────────────────────────┐
-│                          Android 手机   │                         │
+│                          Android 手机    │                        │
 │                                         ▼                        │
-│                            ┌───────────────────────┐             │
-│                            │  audio_player (C)      │             │
-│                            │  (adb exec-out 启动的   │             │
-│                            │   临时进程)             │             │
-│                            │                        │             │
-│                            │  stdin ← 管道          │             │
-│                            │    ↓                   │             │
-│                            │  AAudio/AudioTrack     │             │
-│                            │    ↓                   │             │
-│                            │  扬声器                 │             │
-│                            └───────────────────────┘             │
+│                            ┌──────────────────────────┐          │
+│                            │  audio_player (C)         │          │
+│                            │  ADB shell 启动的进程      │          │
+│                            │                           │          │
+│                            │  TCP server 0.0.0.0:27777 │          │
+│                            │    ↓ accept               │          │
+│                            │  TCP client_fd            │          │
+│                            │    ↓ read()               │          │
+│                            │  AAudioStream_write()     │          │
+│                            │    ↓                      │          │
+│                            │  设备扬声器                │          │
+│                            └──────────────────────────┘          │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -84,17 +91,18 @@
 
 | 模块 | 职责 |
 |------|------|
-| **虚拟音频驱动** | 注册为 Windows 音频输出设备，接收 WASAPI 音频流，通过命名管道发送到用户态服务 |
-| **AudioCaptureManager** | 从命名管道读取 PCM 音频数据，管理缓冲区，统一采样格式 |
-| **StreamForwarder** | 启动 `adb exec-out /data/local/tmp/audio_player`，将 PCM 数据写入该进程的 stdin |
-| **DeviceMonitor** | 定时枚举 ADB 设备，检测连接/断开，查询扬声器能力，断线时切回默认音频设备 |
-| **audio_player** | 极简 C 程序（≈100行），从 stdin 读取 PCM，通过 AAudio API 写入扬声器 |
+| **AudioCaptureManager** | 通过 WASAPI Loopback 从默认音频渲染设备捕获 PCM 数据，管理 COM 生命周期，监听设备变更通知 |
+| **SampleConverter** | float→int 转换、采样率转换（线性插值 SRC）、整数位深转换（8/16/24/32 互转） |
+| **StreamForwarder** | 建立 ADB 端口转发、推送并启动 audio_player、生产者-消费者队列管理、TCP 写入、端到端延迟监控 |
+| **DeviceWatcher** | 每 1 秒轮询 ADB 设备列表，检测连接/断开，获取设备型号，判断扬声器能力 |
+| **AdbWrapper** | ADB 命令封装（devices、dumpsys audio、push、forward、shell 等） |
+| **audio_player** | C 程序，创建设备端 TCP 服务端，从 TCP socket 读取 PCM，通过 AAudio API 写入扬声器 |
 
 ### 模块间通信
 
-- **虚拟音频驱动 ↔ AudioCaptureManager**: **命名管道** `\\.\pipe\AudioBridgePipe`。内核态驱动写入，用户态 C# 服务读取。
-- **StreamForwarder ↔ audio_player**: **ADB exec-out 管道**。C# 进程启动 `adb exec-out` 并获得其 stdin 句柄，直接写入 PCM 数据。不需要 TCP，不需要端口转发。
-- **C# 模块之间**: 同一进程内的函数调用和事件回调。
+- **WASAPI COM 接口（进程内）**：AudioCaptureManager 通过 COM 接口直接调用 WASAPI，从系统音频引擎获取 PCM 缓冲区指针
+- **C# 模块之间**：同一进程内的事件回调（AudioDataReceived、DeviceConnected 等）和直接方法调用
+- **StreamForwarder ↔ audio_player**：ADB TCP 端口转发（`adb forward tcp:27777 tcp:27777`），C# 端 TcpClient 连接本地 27777，ADB 将数据透传到设备端 audio_player 的 TCP 服务端
 
 ---
 
@@ -104,105 +112,93 @@
 Win_Use_Andorid_Audio/
 ├── DESIGN.md                        # 本设计文档
 ├── CLAUDE.md                        # 项目指南
+├── 需求.md                          # 需求文档
 ├── README.md                        # 使用说明
-│
-├── driver/                          # 虚拟音频驱动 (C++ KMDF)
-│   ├── scream/                      # Scream 源码 fork
-│   │   ├── driver/                  # WDM 音频驱动内核代码
-│   │   │   ├── audio.cpp
-│   │   │   ├── audio.h
-│   │   │   ├── device.cpp
-│   │   │   ├── device.h
-│   │   │   └── driver.c
-│   │   └── inf/
-│   │       └── screamaudio.inf
-│   └── patch/
-│       └── pipe_output.patch        # Scream 修改：UDP → 命名管道
 │
 ├── service/                         # 用户态桥接服务 (C# .NET 8)
 │   ├── AudioBridge.sln
 │   └── AudioBridge/
-│       ├── AudioBridge.csproj
+│       ├── AudioBridge.csproj       # 项目文件，将config.json和audio_player链接到requirement/子目录
 │       ├── Program.cs               # 入口：编排整个流程
 │       ├── Config.cs                # 配置管理
+│       ├── config.json              # 运行时配置（音频参数、ADB路径、日志级别、前置衰减）
 │       │
 │       ├── DeviceMonitor/
-│       │   ├── DeviceMonitor.cs     # ADB 设备枚举与状态机
+│       │   ├── DeviceWatcher.cs     # ADB 设备枚举与状态机
 │       │   ├── AdbWrapper.cs        # ADB 命令封装
 │       │   └── DeviceInfo.cs        # 设备信息模型
 │       │
 │       ├── AudioCapture/
-│       │   ├── AudioCaptureManager.cs  # 命名管道读取 PCM
-│       │   └── SampleConverter.cs      # 采样格式转换
+│       │   ├── AudioCaptureManager.cs  # WASAPI Loopback 捕获
+│       │   ├── SampleConverter.cs      # float→int / SRC / 位深转换
+│       │   └── WasapiInterop.cs        # WASAPI COM 接口 P/Invoke 声明
 │       │
 │       ├── Streaming/
-│       │   ├── StreamForwarder.cs      # adb exec-out 进程 + stdin 写入
-│       │   └── AudioPacket.cs          # PCM 数据块封装（含时间戳）
+│       │   ├── StreamForwarder.cs      # ADB TCP forward + 生产者-消费者写入
+│       │   └── AudioPacket.cs          # PCM 数据封装（含时间戳）
 │       │
 │       └── Utils/
-│           ├── Logger.cs               # 日志 + 中文提示
-│           └── SystemAudio.cs          # 默认音频设备切换
+│           ├── Logger.cs               # 控制台 + 文件日志（自动清理旧日志）
+│           └── SystemAudio.cs          # 已废弃，仅保留参考注释
 │
 ├── audio_player/                    # Android 端音频播放器 (C + NDK)
-│   ├── audio_player.c               # 主程序：stdin → AAudio → 扬声器
-│   ├── Makefile                     # NDK standalone 交叉编译
-│   └── build_audio_player.ps1      # Windows 上一键编译脚本
+│   ├── audio_player.c               # 主程序：TCP socket → AAudio → 扬声器
+│   └── build_audio_player.ps1      # Windows 上一键编译脚本（自动下载 NDK）
 │
 ├── scripts/
-│   ├── build_driver.ps1             # 编译驱动
-│   ├── install_driver.ps1           # 安装驱动（管理员）
-│   └── run_bridge.ps1              # 一键启动
+│   ├── build_all.ps1                # 一键构建所有组件
+│   ├── run_bridge.ps1              # 启动 AudioBridge 服务
+│   └── kill_audio_bridge.ps1       # 终止 AudioBridge 进程
 │
-└── tools/
-    └── adb/                         # adb.exe（或系统 PATH 中的 adb）
+├── Source/
+│   ├── ndk/                         # Android NDK r27d（自动下载到此目录）
+│   └── scream_origin/               # Scream 虚拟音频驱动源码（参考用）
 ```
 
 ---
 
 ## 5. 核心接口设计
 
-### 5.1 虚拟音频驱动接口（内核态 ↔ 用户态）
+### 5.1 WASAPI 捕获接口
 
 ```
-命名管道名称: \\.\pipe\AudioBridgePipe
-管道服务端: AudioBridge.Service (C#, Named Pipe Server)
-管道客户端: 虚拟音频驱动 (内核态 ZwCreateFile)
-```
+// AudioCaptureManager 对外接口
+class AudioCaptureManager : IDisposable {
+    event EventHandler<byte[]> AudioDataReceived;   // PCM 数据事件
+    event EventHandler DefaultDeviceChanged;         // 默认音频设备变更
 
-数据块格式（驱动输出到管道的每个消息）：
+    void SetTargetFormat(int sampleRate, int bitsPerSample, int channels);
+    void Start();                                    // 初始化 WASAPI + 启动捕获循环
+    void Stop();
 
-```c
-typedef struct _AUDIO_BLOCK {
-    UINT32  SampleRate;      // 采样率 (44100 / 48000)
-    UINT16  BitsPerSample;   // 位深 (16 / 24 / 32)
-    UINT16  Channels;        // 声道数 (1 / 2)
-    UINT32  DataSize;        // 音频数据大小 (bytes)
-    BYTE    Data[DataSize];  // PCM 样本数据
-} AUDIO_BLOCK;
+    bool IsRunning { get; }
+}
+
+// 格式转换
+static class SampleConverter {
+    static byte[] ConvertFloatToInt(byte[] input, int targetBitsPerSample);
+    static byte[] ConvertFloatToIntWithSRC(byte[] input, int inRate, int outRate, int ch, int bits);
+    static byte[] ConvertIntToInt(byte[] input, int srcBits, int dstBits);
+    static void SetPreAttenuationDb(double db);
+}
 ```
 
 ### 5.2 ADB 管道接口
 
 ```
-# 启动流程（由 C# StreamForwarder 完成）：
+# 端口转发
+adb -s <serial> forward tcp:27777 tcp:27777
+adb -s <serial> forward --remove tcp:27777
 
-# Step 1: 推送播放器到设备
-adb push audio_player /data/local/tmp/
-
-# Step 2: 设置可执行权限
-adb shell chmod 755 /data/local/tmp/audio_player
-
-# Step 3: 启动播放器并绑定 stdin（关键步骤）
-adb exec-out /data/local/tmp/audio_player
-  → C# 端保留此进程的 Process 对象
-  → C# 端将 PCM 数据不断写入 process.StandardInput.BaseStream
-
-# Step 4: 退出时自动清理
-adb shell rm /data/local/tmp/audio_player
+# 推送并启动播放器
+adb -s <serial> push audio_player /data/local/tmp/
+adb -s <serial> shell chmod 755 /data/local/tmp/audio_player
+adb -s <serial> shell -T /data/local/tmp/audio_player 48000 2 32 50 27777
 
 # 设备检测
-adb devices                          # 枚举设备
-adb -s <serial> shell dumpsys audio  # 检查是否有扬声器
+adb devices
+adb -s <serial> shell dumpsys audio              # 检测扬声器
+adb -s <serial> shell getprop ro.product.model   # 获取设备型号
 ```
 
 ### 5.3 audio_player 接口（Android 端）
@@ -210,22 +206,22 @@ adb -s <serial> shell dumpsys audio  # 检查是否有扬声器
 ```c
 // audio_player.c — 完整的程序接口说明
 
-// 命令行参数 (可选):
-//   audio_player [sample_rate] [channels] [buffer_ms]
-//   默认值: 48000, 2, 50
+// 命令行参数:
+//   audio_player [sample_rate] [channels] [bits] [buffer_ms] [port]
+//   默认: audio_player 48000 2 32 50 0
+//   port=0 → stdin 模式（向后兼容）
+//   port>0 → TCP 模式（当前模式）
 
-// 输入: stdin
-//   持续读取 PCM 数据，格式: 16-bit signed, little-endian,
-//   声道交错 (L,R,L,R,...)，默认 48000Hz
+// TCP 模式流程:
+// 1. 创建 AAudioStream (AAUDIO_DIRECTION_OUTPUT, 指定格式参数)
+// 2. wait_for_tcp_connection(port) → socket → bind 0.0.0.0:port → listen → accept
+// 3. 循环: read(tcp_fd, buf, 4096) → AAudioStream_write(buf, 200ms timeout)
+// 4. EOF 或 SIGINT/SIGTERM → AAudioStream_close → 退出
 
-// 输出: 手机扬声器
-//   使用 AAudio API 创建音频流，以 MODE_STREAM 模式写入
+// 通知: 首次成功写入音频后发送 Android 通知（input keyevent + cmd notification post）
+// 输出: 所有诊断信息输出到 stderr（经 ADB 传回 C# 服务）
 
-// 退出条件:
-//   stdin 关闭 (EOF) → 播放完缓冲区剩余数据后退出
-
-// 返回值:
-//   0 = 正常退出, 1 = AAudio 初始化失败
+// 返回值: 0 = 正常退出, 1 = 初始化失败
 ```
 
 ### 5.4 内部模块接口 (C# 类)
@@ -234,52 +230,52 @@ adb -s <serial> shell dumpsys audio  # 检查是否有扬声器
 // === DeviceMonitor ===
 
 class DeviceInfo {
-    string Serial;
-    string Model;
-    bool HasSpeaker;
-    DeviceState State;
+    string Serial;          // ADB 设备序列号
+    string Model;           // 设备型号 (通过 getprop 获取)
+    bool HasSpeaker;        // dumpsys audio 检测结果
+    DeviceState State;      // Disconnected / Connected / Ready / Unsupported
 }
 
 enum DeviceState { Disconnected, Connected, Ready, Unsupported }
 
-class DeviceMonitor : IDisposable {
+class DeviceWatcher : IDisposable {
     event EventHandler<DeviceInfo> DeviceConnected;
     event EventHandler<DeviceInfo> DeviceDisconnected;
-    event EventHandler<string> ErrorOccurred;      // 中文提示
-    void Start();                                   // 每 1 秒轮询
+    event EventHandler<string> ErrorOccurred;
+    void Start();                       // 每 1 秒轮询
     void Stop();
+    void ForgetDevice(string serial);   // 用于重连场景
 }
 
 class AdbWrapper {
-    DeviceInfo[] GetDevices();
-    bool CheckHasSpeaker(string serial);            // dumpsys audio
-    Process StartAudioPlayer(string serial);         // adb exec-out
-    void KillAudioPlayer(Process proc);
-    bool PushFile(string local, string remote);
-}
-
-
-// === AudioCapture ===
-
-class AudioCaptureManager : IDisposable {
-    event EventHandler<byte[]> AudioDataReceived;   // PCM 事件
-    void Start();                                   // 连接命名管道
-    void Stop();
-}
-
-class SampleConverter {
-    byte[] ConvertTo16Bit48kHz(
-        byte[] input, int srcRate, int srcBits, int srcChannels);
+    bool IsAvailable();
+    List<DeviceInfo> GetDevices();
+    bool CheckHasSpeaker(string serial);
+    string? GetDeviceModel(string serial);
+    bool PushFile(string local, string remote, string serial);
+    bool SetExecutable(string remote, string serial);
+    bool SetupForward(string serial, int port);
+    bool RemoveForward(string serial, int port);
+    Process StartAudioPlayer(string serial, string remotePath, int port, ...);
+    void KillAudioPlayer(Process process);
+    bool CleanupRemote(string remote, string serial);
 }
 
 
 // === Streaming ===
 
 class StreamForwarder : IDisposable {
-    void Start(string deviceSerial);
+    event EventHandler ConnectionLost;      // TCP 连接断开
+
+    bool Start(string serial, string localPlayerPath, ...);
     void Stop();
-    void SendAudioData(byte[] pcmData);             // 写入 ADB stdin
+    void SendAudioData(byte[] pcmData);     // 生产者：入队
     bool IsConnected { get; }
+}
+
+class AudioPacket {
+    byte[] Data { get; }
+    DateTime Timestamp { get; }             // 用于延迟追踪
 }
 ```
 
@@ -289,23 +285,23 @@ class StreamForwarder : IDisposable {
 {
   "Audio": {
     "TargetSampleRate": 48000,
-    "TargetBitsPerSample": 16,
+    "TargetBitsPerSample": 32,
     "TargetChannels": 2,
-    "BufferSizeMs": 50
+    "BufferSizeMs": 50,
+    "PreAttenuationDb": -6.0
   },
   "Adb": {
-    "AdbPath": "tools/adb/adb.exe",
-    "PlayerBinary": "audio_player"
-  },
-  "Pipe": {
-    "PipeName": "AudioBridgePipe"
+    "AdbPath": "",
+    "PlayerBinary": "audio_player",
+    "PlayerRemotePath": "/data/local/tmp/audio_player"
   },
   "Logging": {
-    "Level": "Info",
-    "MaxFiles": 7
+    "Level": "Debug"
   }
 }
 ```
+
+`PreAttenuationDb`: 前置衰减 dB。系统混音器叠加多个音源时峰值可能超过 1.0f，-6dB（0.5x）覆盖约 2 路满幅音源。可调低（-9dB、-12dB）以应对更多音源同时输出的场景。
 
 ---
 
@@ -317,65 +313,76 @@ class StreamForwarder : IDisposable {
 [用户插上手机 USB 线]
      │
      ▼
-[DeviceMonitor 检测到新 ADB 设备]
+[DeviceWatcher 检测到新 ADB 设备]  ← 每1秒adb devices
      │
      ▼
-[检查设备是否有扬声器]  ← adb shell dumpsys audio
+[检查设备是否有扬声器]  ← adb shell dumpsys audio（多关键词匹配）
   ┌──┴──┐
   │ 有  │  无 → [提示"该设备不包含扬声器，无法使用"] → 结束
   └──┬──┘
-     ▼
-[adb push audio_player → /data/local/tmp/]
-[adb shell chmod 755 …]
      │
      ▼
-[安装/启动虚拟音频驱动（如尚未安装）]
+[获取设备型号]  ← adb shell getprop ro.product.model
      │
      ▼
-[启动 AudioCaptureManager → 连接命名管道]
+[设备连接事件] DeviceConnected
+     │
+     ├─── Step 1: SetupForward → adb forward tcp:27777 tcp:27777
+     ├─── Step 2: PushFile + chmod (audio_player → /data/local/tmp/)
+     ├─── Step 3: StartAudioPlayer → adb shell -T (TCP模式, port=27777)
+     ├─── Step 4: 等待 "Waiting for TCP connection on" 标记
+     ├─── Step 5: TcpClient.Connect(127.0.0.1:27777)
+     ├─── Step 6: 启动生产者-消费者队列 + 写入线程
+     └─── Step 7: AudioCaptureManager.Start() → WASAPI Loopback开始捕获
      │
      ▼
-[启动 adb exec-out /data/local/tmp/audio_player]
-  → 获取 process.StandardInput 句柄
+[主循环: WASAPI → 格式转换 → 队列 → TCP → ADB → Android → 扬声器]
      │
      ▼
-[主循环: 命名管道 → PCM → SampleConverter → ADB stdin → Android手机播放]
+[用户拔掉 USB / 进程退出 / TCP 连接丢失]
      │
      ▼
-[用户拔掉 USB 或程序退出]
-     │
-     ▼
-[恢复 Windows 默认音频设备 → 终止 adb exec-out → 清理设备文件]
+[安全停止: 停止捕获 → 排空队列 → 关闭TCP → Kill进程 → 移除forward → 清理]
 ```
 
 ### 6.2 音频数据路径（详细）
 
 ```
-Windows 音频子系统 (应用输出 → 虚拟设备)
+Windows 音频子系统 (应用输出 → 默认渲染设备)
     │
     ▼
-虚拟音频驱动 (Scream 改造)
-    │ 从 WDM 缓冲区提取 PCM，写入命名管道
+WASAPI Loopback (AudioCaptureManager)
+    │ IMMDeviceEnumerator → IAudioClient(LOOPBACK) → IAudioCaptureClient
+    │ GetBuffer → Marshal.Copy → ReleaseBuffer
     ▼
-命名管道 \\.\pipe\AudioBridgePipe
-    │ 内核态 → 用户态传输
+格式转换 (ConvertFormat 内部方法)
+    │ float→int (最常见)
+    │ 或 线性插值 SRC (float输入, 采样率不匹配时)
+    │ 或 整数位深转换 (8/16/24/32互转)
     ▼
-AudioCaptureManager
-    │ 读取 AUDIO_BLOCK，保持内部环形缓冲区
+AudioDataReceived 事件 (byte[] pcmData)
+    │
     ▼
-SampleConverter
-    │ 将任意采样格式转换为 16-bit 48000Hz 立体声
+StreamForwarder.SendAudioData()
+    │ BlockingCollection<AudioPacket>.Add()
     ▼
-StreamForwarder
-    │ 写入 adb exec-out 进程的 stdin
+生产者-消费者队列 (最大500包，满时丢弃)
+    │ WriteLoop() 专用线程 foreach 消费
     ▼
-adb exec-out (USB 传输)
-    │ stdin 数据流经 USB → Android 端进程
+TcpClient.GetStream().Write(data)
+    │
     ▼
-audio_player (stdin)
-    │ 循环: read(stdin, buf, 4096) → AAudioStream::write(buf)
+127.0.0.1:27777 → adb forward
+    │ ADB 守护进程通过 USB 透传 TCP 数据
     ▼
-AAudio 音频流 → 硬件混音器 → 扬声器
+audio_player (Android, TCP server 0.0.0.0:27777)
+    │ accept() → client_fd
+    │ read(client_fd, buf, 4096)
+    ▼
+AAudioStream_write(stream, buf, frame_count, 200ms timeout)
+    │
+    ▼
+Android AudioFlinger → 硬件混音器 → 扬声器
 ```
 
 ### 6.3 设备状态机
@@ -399,104 +406,104 @@ AAudio 音频流 → 硬件混音器 → 扬声器
  │ → 开始转发音频  │ │ → 提示用户     │
  └───────┬────────┘ └────────────────┘
          │
-         │ USB 断开 / ADB 断开 / audio_player 进程退出
+         │ USB 断开 / ADB 断开 / TCP 写入异常
          ▼
  ┌────────────────┐
  │  Disconnected   │
+ │  (自动清理)      │
  └────────────────┘
+         │
+         │ (下次轮询可能重新检测)
+         ▼
+    [回到 Disconnected]
 ```
 
 ### 6.4 异常/错误处理路径
 
 | 异常场景 | 处理方式 |
 |----------|----------|
-| ADB 未找到 | 启动时检测 adb.exe，提示"请安装 ADB 工具" |
-| 手机未开启 USB 调试 | `adb devices` 显示 unauthorized，提示"请在手机上开启 USB 调试并授权" |
+| ADB 未找到 | 启动时检测 adb.exe，提示"请安装 ADB 工具"并退出 |
+| 手机未开启 USB 调试 | `adb devices` 不显示"device"状态，不会被检测到 |
 | 设备无扬声器 | 提示"该设备不包含扬声器，无法作为音频输出设备" |
-| USB 断开 | DeviceMonitor 检测到设备消失 → 终止 exec-out 进程 → 恢复默认音频设备 → 提示"设备已断开" |
-| audio_player 崩溃 | StreamForwarder 检测到进程退出 → 自动重启 |
-| 驱动安装失败 | 提示"虚拟音频驱动安装失败，请尝试以管理员身份运行" |
-| 音频卡顿 | 自动增大缓冲区大小 |
+| USB 断开 | DeviceWatcher 检测到设备消失 → 停止转发 → 清理 → 提示"设备已断开" |
+| TCP 连接异常 | StreamForwarder 触发 ConnectionLost → Program.cs 断开设备 + ForgetDevice → 下次轮询自动重连 |
+| audio_player 崩溃 | Exited 事件记录 exit code → stderr reader 结束 → TCP 写入失败 → ConnectionLost → 自动重连 |
+| WASAPI 初始化失败 | 日志 Error → 跳过启动，不影响 ADB 管道建立 |
+| WASAPI 默认设备切换 | IMMNotificationClient 检测 → 异步重启 WASAPI 捕获 |
+| 音频卡顿/队列满 | 日志 Warn → 丢弃新数据 → 继续处理已有数据 |
+| 配置文件缺失 | 使用默认配置 + Warn 提示 |
 
 ---
 
 ## 7. 数据存储设计
 
-本项目**不需要持久化存储**。音频流实时传输、不落盘。配置通过 `config.json` 保存（见 5.5 节）。
+本项目**不需要持久化存储**。音频流实时传输、不落盘。配置通过 `config.json` 保存（见 5.5 节）。日志文件存储在 `Log/` 目录，按日期管理，非当日日志在下次启动时自动清理。
 
 ---
 
 ## 8. 分步实现计划
 
-### 阶段一：虚拟音频驱动改造（预计 3-5 天）
+### 阶段一：Android 音频播放器与 ADB 管道（已完成）
 
-**目标**：虚拟音频驱动能在 Windows 中注册为扬声器设备，将音频数据输出到命名管道。
-
-**具体工作**：
-
-1. 克隆 [Scream](https://github.com/duncanthrax/scream) 仓库，理解其驱动架构
-2. 修改 Scream 驱动：移除 UDP 网络发送，改为写入命名管道
-3. 编写 INF 文件，注册为"AudioBridge Virtual Audio Device"
-4. 用 C# 写一个测试工具连接命名管道，验证接收到的音频数据可通过写入 WAV 文件回放
-
-**前置依赖**：Windows 10/11 + Visual Studio 2022 (C++ 桌面开发 + WDK)，驱动测试签名模式
-
-**验收标准**：
-- Windows 声音输出设备中可见 AudioBridge 设备
-- 设置默认设备后播放音乐，命名管道侧能收到可识别 PCM 数据
-
-### 阶段二：Android 音频播放器与 ADB 管道（预计 2 天）
-
-**目标**：通过 `adb exec-out` 在手机上启动播放器进程，PC 端写入 PCM 数据到其 stdin，手机扬声器发声。
+**目标**：通过 `adb shell -T` 在手机上启动播放器进程，Android 扬声器发声。
 
 **具体工作**：
 
-1. 编写 `audio_player.c`（约 100 行）：
+1. 编写 `audio_player.c`（~300 行）：
    - 使用 AAudio API 创建音频输出流
-   - 从 stdin 循环读取 PCM 数据并写入 AAudioStream
-   - 处理 stdin EOF 退出和 SIGTERM 信号
-2. 编写 Makefile，用 NDK standalone toolchain 交叉编译
-3. 用 C# 写测试工具：`adb push` 播放器 → `adb exec-out` → 写入测试 PCM 数据
-4. 验证：播放已知的正弦波或 WAV 数据，手机扬声器输出可识别的声音
+   - wait_for_tcp_connection() 创建设备端 TCP 服务端
+   - 循环 read(tcp_fd) → AAudioStream_write()
+   - 处理 SIGINT/SIGTERM 信号优雅退出
+   - 首次写入后发送手机通知
+2. 编写 `build_audio_player.ps1`，用 NDK standalone toolchain 交叉编译（自动下载 NDK）
+3. C# 端测试工具验证：adb push → adb forward → adb shell -T → TCP 写入 PCM 数据
 
-**前置依赖**：Android NDK (r25+)，一台开启 USB 调试的手机（系统 Android 8.0+，AAudio 的最低版本）
+**前置依赖**：Android NDK (r27d)，一台开启 USB 调试的手机（Android 8.0+，AAudio 的最低版本）
 
-**验收标准**：
-- 手动执行 `adb exec-out /data/local/tmp/audio_player < test.pcm` 可听到声音
-- C# 测试工具启动后，手机扬声器输出电脑播放的音乐
+### 阶段二：WASAPI Loopback 捕获（已完成）
 
-### 阶段三：主服务集成（预计 3-4 天）
-
-**目标**：完整的 C# 服务自动完成设备检测、驱动加载、音频转发全流程。
+**目标**：通过 WASAPI Loopback 从 Windows 默认音频渲染设备捕获 PCM 数据。
 
 **具体工作**：
 
-1. 实现 `DeviceMonitor`：每 1 秒轮询 ADB 设备列表，管理状态机
-2. 实现 `AdbWrapper`：封装 `devices`、`dumpsys audio`、`push`、`exec-out` 等命令
-3. 实现 `StreamForwarder`：启动 ADB 进程并管理 stdin 写入
-4. 实现 `SystemAudio`：通过 Windows API 设置/恢复默认音频设备
-5. 实现 `Program.cs` 流程编排
-6. 中文提示和错误处理覆盖所有用户可见输出
+1. 声明 WASAPI COM 接口（WasapiInterop.cs）：IMMDeviceEnumerator、IAudioClient、IAudioCaptureClient
+2. 实现 AudioCaptureManager：
+   - WASAPI 初始化：GetDefaultAudioEndpoint → Activate → GetMixFormat → Initialize(LOOPBACK) → Start
+   - 捕获循环：GetNextPacketSize → GetBuffer → 格式转换 → AudioDataReceived → ReleaseBuffer
+   - 5 秒统计定时器
+   - IMMNotificationClient 注册监听默认设备变更
+3. 实现 SampleConverter：float→int、SRC（线性插值）、整数位深转换
 
-**前置依赖**：阶段一（驱动可输出命名管道）、阶段二（audio_player 可用）
+**前置依赖**：Windows 10/11，任意活动的音频输出设备
 
-**验收标准**：
-- 插上手机启动程序 → 自动检测 →  开始转发 → 手机播放电脑声音
-- 拔掉 USB → 自动停止转发 → 恢复默认音频设备 → 中文提示
-- 连接不支持音频的设备 → 提示"该设备不包含扬声器"
+### 阶段三：主服务集成（已完成）
 
-### 阶段四：部署与优化（预计 2 天）
-
-**目标**：一键部署，性能达标。
+**目标**：完整的 C# 服务自动完成设备检测、音频捕获、ADB 转发全流程。
 
 **具体工作**：
 
-1. 驱动安装脚本（测试签名模式 + INF 安装）
+1. 实现 DeviceWatcher：每 1 秒轮询 ADB 设备列表，管理状态机
+2. 实现 AdbWrapper：封装 devices、dumpsys audio、push、forward、shell 等命令
+3. 实现 StreamForwarder：ADB 端口转发、audio_player 生命周期管理、生产者-消费者队列、TCP 写入
+4. 实现 Program.cs 流程编排：设备连接→转发建立→捕获启动→异常处理→自动重连
+5. 实现音频格式链式转换（ConvertFormat），支持采样率、位深、声道不匹配的降级处理
+
+### 阶段四：部署与优化（完成度 90%）
+
+**目标**：一键部署，性能达标，异常自愈。
+
+**具体工作**：
+
+1. `build_all.ps1` 一键构建脚本
 2. `run_bridge.ps1` 一键启动脚本
-3. C# 单文件发布（`dotnet publish --self-contained`）
-4. 调节命名管道和 AAudio 缓冲区大小以优化延迟
-5. 测试 44100/48000Hz、16/24/32-bit 格式的兼容性
+3. C# 单文件发布（dotnet build --configuration Release）
+4. 生产者-消费者队列解耦捕获和写入速率
+5. 前置衰减（PreAttenuationDb）应对多音源削波
+6. IMMNotificationClient 处理默认设备切换
+7. ConnectionLost + ForgetDevice 自动重连机制
+8. 5 秒统计定时器监控音频流健康状态
 
-**验收标准**：
-- 新用户按 README 步骤在 10 分钟内完成配置
-- 延迟 < 300ms，播放音乐无明显爆音卡顿
+**待优化**：
+- audio_player 崩溃自动重启（当前依赖 ConnectionLost → 轮询重连）
+- 多设备支持
+- 无音频设备时的自动重试
