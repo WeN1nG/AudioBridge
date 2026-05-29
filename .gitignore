@@ -1,0 +1,34 @@
+# IDE / Claude
+.claude/settings.local.json
+command.txt
+
+# Build outputs
+publish_output*/
+service/AudioBridge/bin/
+service/AudioBridge/obj/
+
+# Logs
+Log/
+
+# Android NDK (large, download via build script)
+Source/ndk/
+
+# Compiled binaries (build from source instead)
+audio_player/audio_player
+audio_player/audio_test_tone
+
+# Scream driver (not used since WASAPI migration)
+driver/
+
+# Scream source reference (no longer needed)
+Source/scream_origin/
+
+# Pre-built distribution archives
+distwithnet8.rar
+distwithoutnet8.rar
+
+# OS
+Thumbs.db
+.DS_Store
+
+dist/

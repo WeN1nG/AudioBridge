@@ -1,0 +1,17 @@
+{
+  "Audio": {
+    "TargetSampleRate": 48000,
+    "TargetBitsPerSample": 32,
+    "TargetChannels": 2,
+    "BufferSizeMs": 50,
+    "PreAttenuationDb": -6.0
+  },
+  "Adb": {
+    "AdbPath": "",
+    "PlayerBinary": "audio_player",
+    "PlayerRemotePath": "/data/local/tmp/audio_player"
+  },
+  "Logging": {
+    "Level": "Debug"
+  }
+}
