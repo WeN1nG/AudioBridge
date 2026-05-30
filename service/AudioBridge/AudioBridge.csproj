@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -8,8 +8,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Content Include="config.json" CopyToOutputDirectory="PreserveNewest" />
-    <Content Include="..\..\audio_player\audio_player" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="config.json" CopyToOutputDirectory="PreserveNewest" Link="requirement\config.json" />
+    <Content Include="..\..\audio_player\audio_player" CopyToOutputDirectory="PreserveNewest" Link="requirement\audio_player" />
   </ItemGroup>
 
 </Project>

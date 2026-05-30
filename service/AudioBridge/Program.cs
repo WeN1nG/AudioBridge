@@ -30,7 +30,7 @@ class Program
         Console.WriteLine();
 
         string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-        string configPath = Path.Combine(baseDir, "config.json");
+        string configPath = Path.Combine(baseDir, "requirement", "config.json");
 
         _config = Config.Load(configPath);
         Logger.Level = ParseLogLevel(_config.Logging.Level);
@@ -89,7 +89,7 @@ class Program
         _activeSerial = device.Serial;
 
         // Start forwarder FIRST so we don't drop UDP packets during setup
-        string playerLocal = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "audio_player");
+        string playerLocal = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "requirement", "audio_player");
         if (!File.Exists(playerLocal))
         {
             playerLocal = Path.Combine(
@@ -207,6 +207,11 @@ class Program
     {
         if (!string.IsNullOrEmpty(configuredPath) && File.Exists(configuredPath))
             return configuredPath;
+
+        // Check alongside the exe first (for bundled deployment)
+        string? localAdb = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "requirement", "adb.exe");
+        if (File.Exists(localAdb))
+            return localAdb;
 
         try
         {
